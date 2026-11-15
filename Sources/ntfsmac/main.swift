@@ -14,6 +14,9 @@ usage: ntfsmac <command> [args]
   unmount <disk> [--eject]      unmount            (needs root)
   fix <disk>                    clear dirty flag   (needs root)
   doctor                        check the installation
+  install-helper                auto-mount drives when plugged in + no password prompts (needs root)
+  uninstall-helper              remove the background service (needs root)
+  watch                         run the auto-mount loop (used by the background service)
 
 <disk> is a BSD identifier from `ntfsmac list`, e.g. disk4s1.
 """
@@ -76,10 +79,23 @@ case "fix":
     do { try Mounter.validate(id: id) } catch { fail("\(error)", code: 64) }
     requireRoot()
     do { print(try Mounter.fix(id: id)) } catch { fail("\(error)") }
+case "install-helper":
+    requireRoot()
+    let (u, _) = invokingUser()
+    guard u != 0, let pw = getpwuid(u) else { fail("run with sudo from your own account (not as root)") }
+    do { try Helper.install(user: String(cString: pw.pointee.pw_name)); print("Automatic mounting enabled.") }
+    catch { fail("\(error)") }
+case "uninstall-helper":
+    requireRoot()
+    do { try Helper.uninstall(); print("Automatic mounting disabled.") } catch { fail("\(error)") }
+case "watch":
+    requireRoot()
+    Helper.watch()
 case "doctor":
     print("FUSE-T:    \(Mounter.fuseTInstalled() ? "installed" : "MISSING (brew install --cask macos-fuse-t/cask/fuse-t)")")
     print("ntfs-3g:   \(Mounter.driverPath() ?? "MISSING (run scripts/build-driver.sh)")")
     print("root:      \(geteuid() == 0 ? "yes" : "no (mount/unmount need sudo)")")
+    print("auto-mount: \(Helper.isInstalled ? "enabled (\(Helper.plistPath))" : "off (sudo ntfsmac install-helper)")")
 default:
     print(usage); exit(64)
 }

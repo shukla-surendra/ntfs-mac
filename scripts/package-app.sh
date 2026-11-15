@@ -41,5 +41,10 @@ cat > "$APP/Contents/Info.plist" <<PL
 
 </dict></plist>
 PL
+# install_name_tool invalidates signatures, and --deep does not re-sign Mach-O files under
+# Contents/Resources. An invalid dylib signature makes the kernel SIGKILL ntfs-3g on load.
+for f in "$R"/lib/*.dylib "$R"/bin/* "$R"/sbin/*; do codesign --force --sign - "$f"; done
 codesign --force --deep --sign - "$APP"
+for f in "$R"/lib/*.dylib "$R"/bin/* "$R"/sbin/*; do codesign --verify --strict "$f"; done
+"$R/bin/ntfs-3g" --version >/dev/null 2>&1 || { echo "Bundled ntfs-3g fails to run"; exit 1; }
 echo "Built: $APP"

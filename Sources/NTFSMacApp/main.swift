@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self?.runPrivileged(force ? ["mount", "--force"] : ["mount"], id: id, done: "mounted")
         }
+        model.autoMount = Helper.isInstalled
+        model.onToggleAutoMount = { [weak self] on in self?.setAutoMount(on) }
         model.onUnmount = { [weak self] id, eject in
             self?.runPrivileged(eject ? ["unmount", "--eject"] : ["unmount"], id: id, done: "unmounted")
         }
@@ -48,8 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let v = Discovery.ntfsVolumes()
             DispatchQueue.main.async {
                 self?.volumes = v
-                self?.model.volumes = v
                 self?.model.fuseInstalled = Mounter.fuseTInstalled()
+                self?.model.scanned = true
+                self?.model.volumes = v
             }
         }
     }
@@ -90,6 +93,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        let auto = NSMenuItem(title: "Mount Automatically When Plugged In", action: #selector(toggleAutoMount), keyEquivalent: "")
+        auto.target = self; auto.state = Helper.isInstalled ? .on : .off
+        menu.addItem(auto)
         menu.addItem(withTitle: "Quit NTFS Mac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
@@ -124,20 +130,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let id = id, (try? Mounter.validate(id: id)) != nil else { return }
         guard let cli = cliPath() else { return alert("ntfsmac CLI not found next to the app.") }
         busy.insert(id); model.busy = busy
-        let cmd = "NTFSMAC_UID=\(getuid()) NTFSMAC_GID=\(getgid()) \(shq(cli)) \((sub + [id]).joined(separator: " "))"
-        let script = "do shell script \"\(asEscape(cmd))\" with administrator privileges"
         queue.async { [weak self] in
-            let r = Shell.run("/usr/bin/osascript", ["-e", script])
+            // With the helper installed, sudoers lets us run its CLI without a password.
+            var r: ShellResult? = Helper.isInstalled ? Shell.run("/usr/bin/sudo", ["-n", Helper.cliPath] + sub + [id]) : nil
+            if let e = r?.stderr, e.contains("password is required") || e.contains("not allowed") { r = nil }
+            let res = r ?? Self.runAsAdmin(cli, sub + [id])
             DispatchQueue.main.async {
                 self?.busy.remove(id); self?.model.busy = self?.busy ?? []
-                if r.status != 0 {
-                    let msg = r.stderr.contains("-128") ? nil : r.stderr   // -128 = user cancelled
+                if res.status != 0 {
+                    let msg = res.stderr.contains("-128") ? nil : res.stderr   // -128 = user cancelled
                     if let msg = msg { self?.alert(Self.clean(msg)) }
                 }
                 self?.refresh()
             }
         }
     }
+
+    /// Runs the CLI as root via the standard macOS admin-password prompt.
+    private static func runAsAdmin(_ cli: String, _ args: [String]) -> ShellResult {
+        let cmd = "NTFSMAC_UID=\(getuid()) NTFSMAC_GID=\(getgid()) \(shq(cli)) " + args.map(shq).joined(separator: " ")
+        return Shell.run("/usr/bin/osascript", ["-e", "do shell script \"\(asEscape(cmd))\" with administrator privileges"])
+    }
+
+    private func setAutoMount(_ on: Bool) {
+        guard let cli = cliPath() else { return alert("ntfsmac CLI not found next to the app.") }
+        queue.async { [weak self] in
+            let r = Self.runAsAdmin(cli, [on ? "install-helper" : "uninstall-helper"])
+            DispatchQueue.main.async {
+                if r.status != 0, !r.stderr.contains("-128") { self?.alert(Self.clean(r.stderr)) }
+                self?.model.autoMount = Helper.isInstalled
+                self?.model.onChange()
+                self?.refresh()
+            }
+        }
+    }
+    @objc private func toggleAutoMount() { setAutoMount(!Helper.isInstalled) }
 
     // MARK: Helpers
 
@@ -146,8 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let p = dir.appendingPathComponent("ntfsmac").path
         return FileManager.default.isExecutableFile(atPath: p) ? p : nil
     }
-    private func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-    private func asEscape(_ s: String) -> String {
+    private static func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    private static func asEscape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }
     private static func clean(_ s: String) -> String {
@@ -167,15 +194,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// MARK: Main menu (Finder's names and shortcuts). Items have no target, so they travel the
+// responder chain to text fields first, then to MainWindowController (the window's delegate).
+
 let app = NSApplication.shared
 let mainMenu = NSMenu()
-let appItem = NSMenuItem(); mainMenu.addItem(appItem)
-let appMenu = NSMenu(); appItem.submenu = appMenu
-appMenu.addItem(withTitle: "Quit NTFS Mac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-let editItem = NSMenuItem(); mainMenu.addItem(editItem)
-let editMenu = NSMenu(title: "Edit"); editItem.submenu = editMenu
-editMenu.addItem(withTitle: "Copy", action: Selector(("copy:")), keyEquivalent: "c")
-editMenu.addItem(withTitle: "Paste", action: Selector(("paste:")), keyEquivalent: "v")
+
+func submenu(_ title: String) -> NSMenu {
+    let item = NSMenuItem(); mainMenu.addItem(item)
+    let m = NSMenu(title: title); item.submenu = m; return m
+}
+@discardableResult
+func add(_ m: NSMenu, _ title: String, _ sel: Selector?, _ key: String = "", _ mods: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+    let i = m.addItem(withTitle: title, action: sel, keyEquivalent: key)
+    i.keyEquivalentModifierMask = mods
+    return i
+}
+func arrow(_ k: Int) -> String { String(Character(UnicodeScalar(k)!)) }
+typealias W = MainWindowController
+
+let appMenu = submenu("NTFS Mac")
+add(appMenu, "About NTFS Mac", #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
+appMenu.addItem(.separator())
+add(appMenu, "Hide NTFS Mac", #selector(NSApplication.hide(_:)), "h")
+add(appMenu, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
+add(appMenu, "Show All", #selector(NSApplication.unhideAllApplications(_:)))
+appMenu.addItem(.separator())
+add(appMenu, "Quit NTFS Mac", #selector(NSApplication.terminate(_:)), "q")
+
+let fileMenu = submenu("File")
+add(fileMenu, "New Folder", #selector(W.newFolder(_:)), "n", [.command, .shift])
+add(fileMenu, "Open", #selector(W.openItems(_:)), "o")
+add(fileMenu, "Close Window", #selector(NSWindow.performClose(_:)), "w")
+fileMenu.addItem(.separator())
+add(fileMenu, "Delete Immediately…", #selector(W.deleteItems(_:)), "\u{8}")
+fileMenu.addItem(.separator())
+add(fileMenu, "Rename", #selector(W.rename(_:)))
+add(fileMenu, "Duplicate", #selector(W.duplicate(_:)), "d")
+add(fileMenu, "Quick Look", #selector(W.quickLook(_:)), "y")
+add(fileMenu, "Show in Finder", #selector(W.revealInFinder(_:)), "r", [.command, .option])
+fileMenu.addItem(.separator())
+add(fileMenu, "Eject", #selector(W.ejectDrive(_:)), "e")
+
+let editMenu = submenu("Edit")
+add(editMenu, "Undo", Selector(("undo:")), "z")
+add(editMenu, "Redo", Selector(("redo:")), "z", [.command, .shift])
+editMenu.addItem(.separator())
+add(editMenu, "Cut", #selector(NSText.cut(_:)), "x")
+add(editMenu, "Copy", #selector(NSText.copy(_:)), "c")
+add(editMenu, "Paste", #selector(NSText.paste(_:)), "v")
+add(editMenu, "Select All", #selector(NSText.selectAll(_:)), "a")
+editMenu.addItem(.separator())
+add(editMenu, "Find", #selector(W.focusSearch(_:)), "f")
+
+let viewMenu = submenu("View")
+add(viewMenu, "as Icons", #selector(W.viewAsIcons(_:)), "1")
+add(viewMenu, "as List", #selector(W.viewAsList(_:)), "2")
+viewMenu.addItem(.separator())
+add(viewMenu, "Toggle Sidebar", #selector(NSSplitViewController.toggleSidebar(_:)), "s", [.command, .control])
+add(viewMenu, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
+
+let goMenu = submenu("Go")
+add(goMenu, "Back", #selector(W.goBack(_:)), "[")
+add(goMenu, "Forward", #selector(W.goForward(_:)), "]")
+add(goMenu, "Enclosing Folder", #selector(W.goEnclosing(_:)), arrow(NSUpArrowFunctionKey))
+add(goMenu, "Open Selection", #selector(W.openItems(_:)), arrow(NSDownArrowFunctionKey))
+
+let driveMenu = submenu("Drive")
+add(driveMenu, "Mount Read-Write", #selector(W.mountDrive(_:)), "m", [.command, .shift])
+add(driveMenu, "Discard Windows Hibernation & Mount…", #selector(W.forceMountDrive(_:)))
+add(driveMenu, "Unmount", #selector(W.unmountDrive(_:)), "u", [.command, .shift])
+add(driveMenu, "Eject", #selector(W.ejectDrive(_:)))
+driveMenu.addItem(.separator())
+add(driveMenu, "Mount Drives Automatically When Plugged In", #selector(W.toggleAutoMount(_:)))
+
+let windowMenu = submenu("Window")
+add(windowMenu, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
+add(windowMenu, "Zoom", #selector(NSWindow.performZoom(_:)))
+app.windowsMenu = windowMenu
+
 app.mainMenu = mainMenu
 app.setActivationPolicy(.regular)
 let delegate = AppDelegate()
