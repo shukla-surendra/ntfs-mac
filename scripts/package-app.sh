@@ -9,6 +9,7 @@ BIN="$(swift build -c release --show-bin-path)"
 APP="$ROOT/dist/NTFS Mac.app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/ntfs-3g"/{bin,sbin,lib}
 cp "$BIN/NTFSMacApp" "$BIN/ntfsmac" "$APP/Contents/MacOS/"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 P=build/prefix; R="$APP/Contents/Resources/ntfs-3g"
 cp "$P/bin/ntfs-3g" "$P/bin/ntfsfix" "$R/bin/"
@@ -34,6 +35,7 @@ cat > "$APP/Contents/Info.plist" <<PL
 <key>CFBundleExecutable</key><string>NTFSMacApp</string>
 <key>CFBundleVersion</key><string>0.1.0</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 
